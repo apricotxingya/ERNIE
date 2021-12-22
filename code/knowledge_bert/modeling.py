@@ -986,8 +986,13 @@ class BertForEntityTyping(PreTrainedBertModel):
 
         if labels is not None:
             loss_fct = BCEWithLogitsLoss()
+            u,s,v = torch.svd(pooled_output.t())
+            ll = s.size(0)
+            SR = 0
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1, self.num_labels))
-            return loss
+            return loss + 0.001 * SR
         else:
             return logits
 
@@ -1013,9 +1018,14 @@ class BertForSTSB(PreTrainedBertModel):
         if labels is not None:
             #loss_fct = CrossEntropyLoss()
             #loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            u,s,v = torch.svd(pooled_output.t())
+            ll = s.size(0)
+            SR = 0
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             per_example_loss = -torch.sum(labels * probs, -1)
             loss = torch.mean(per_example_loss)
-            return loss
+            return loss + 0.001 * SR
         else:
             return self.mm(logits)
 
@@ -1075,13 +1085,19 @@ class BertForSequenceClassification(PreTrainedBertModel):
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, input_ent=None, ent_mask=None, labels=None):
         _, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, input_ent, ent_mask, output_all_encoded_layers=False)
+
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
         if labels is not None:
+            SR = 0
+            u,s,v = torch.svd(pooled_outputd.t())
+            ll = s.size(0)
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            return loss
+            return loss + 0.001 * SR
         else:
             return logits
 
@@ -1118,10 +1134,15 @@ class BertForNQ(PreTrainedBertModel):
         reshaped_logits = torch.cat([null_socre, reshaped_logits], -1) + choice_mask
 
         if labels is not None:
+            SR = 0
+            u,s,v = torch.svd(pooled_outputd.t())
+            ll = s.size(0)
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             weight = torch.FloatTensor([0.3]+[1]*16).cuda()
             loss_fct = CrossEntropyLoss(weight)
             loss = loss_fct(reshaped_logits, labels+1)
-            return loss
+            return loss + 0.001 * SR
         else:
             return reshaped_logits
 
@@ -1187,9 +1208,14 @@ class BertForMultipleChoice(PreTrainedBertModel):
         reshaped_logits = logits.view(-1, self.num_choices)
 
         if labels is not None:
+            SR = 0
+            u,s,v = torch.svd(pooled_outputd.t())
+            ll = s.size(0)
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(reshaped_logits, labels)
-            return loss
+            return loss + 0.001 * SR
         else:
             return reshaped_logits
 
@@ -1253,9 +1279,14 @@ class BertForTokenClassification(PreTrainedBertModel):
         logits = self.classifier(sequence_output)
 
         if labels is not None:
+            SR = 0
+            u,s,v = torch.svd(sequence_output.t())
+            ll = s.size(0)
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            return loss
+            return loss + 0.001 * SR
         else:
             return logits
 
@@ -1331,6 +1362,11 @@ class BertForQuestionAnswering(PreTrainedBertModel):
         end_logits = end_logits.squeeze(-1)
 
         if start_positions is not None and end_positions is not None:
+            SR = 0
+            u,s,v = torch.svd(sequence_output.t())
+            ll = s.size(0)
+            for i in range(1):
+                SR = SR + torch.pow(s[ll-1-i],2)
             # If we are on multi-GPU, split add a dimension
             if len(start_positions.size()) > 1:
                 start_positions = start_positions.squeeze(-1)
@@ -1345,6 +1381,6 @@ class BertForQuestionAnswering(PreTrainedBertModel):
             start_loss = loss_fct(start_logits, start_positions)
             end_loss = loss_fct(end_logits, end_positions)
             total_loss = (start_loss + end_loss) / 2
-            return total_loss
+            return total_loss + 0.0001 * SR
         else:
             return start_logits, end_logits
