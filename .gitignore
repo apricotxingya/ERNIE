@@ -120,3 +120,4 @@ dmypy.json
 
 # TF code
 tensorflow_code
+.DS_Store

@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BERT finetuning runner."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -33,7 +32,7 @@ from torch.utils.data import TensorDataset, DataLoader, RandomSampler, Sequentia
 from torch.utils.data.distributed import DistributedSampler
 
 from knowledge_bert.tokenization import BertTokenizer
-from knowledge_bert.modeling import BertForSequenceClassification
+from knowledge_bert.modeling import BertForMultipleChoice 
 from knowledge_bert.optimization import BertAdam
 from knowledge_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 
@@ -96,193 +95,149 @@ class DataProcessor(object):
         with open(input_file, "r", encoding='utf-8') as f:
             return json.loads(f.read())
 
-class TacredProcessor(DataProcessor):
-    """Processor for the CoLA data set (GLUE version)."""
+class CommonsenseQaProcessor(DataProcessor):
+    """Processor for the ANLI data set."""
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        examples = self._create_examples(
-            self._read_json(os.path.join(data_dir, "train.json")), "train")
-        labels = set([x.label for x in examples])
-        return examples, list(labels)
+        return self._create_examples(
+            self._read_csv(os.path.join(data_dir, "train.csv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_json(os.path.join(data_dir, "dev.json")), "dev")
+            self._read_csv(os.path.join(data_dir, "valid.csv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_csv(os.path.join(data_dir, "test.csv")), "dev")
+
+    def get_examples_from_file(self, input_file):
+        return self._create_examples(
+            self._read_csv(input_file), "to-pred")
 
     def get_labels(self):
-        """Useless"""
-        return ["0", "1"]
+        """See base class."""
+        return ["0", "1", "2", "3"]
 
-    def _create_examples(self, lines, set_type):
+    def _create_examples(self, records, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            for x in line['ents']:
-                if x[1] == 1:
-                    x[1] = 0
-                    #print(line['text'][x[1]:x[2]].encode("utf-8"))
-            text_a = (line['text'], line['ents'])
-            label = line['label']
+        for (i, record) in enumerate(records):
+            guid = record["id"]
+            context = record["context"]
+            question = record["question"]
+            answer1 = record["answer0"]
+            answer2 = record["answer1"]
+            answer3 = record["answer2"]
+            answer4 = record["answer3"]
+            label = record["label"]
+
             examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=line['ann'], label=label))
+                SwagExample(swag_id=guid,
+                 context_sentence=context,
+                 start_ending=question,
+                 ending_0=answer1,
+                 ending_1=answer2,
+                 ending_2=answer3,
+                 ending_3=answer4,
+                 label=int(label))
+            )
         return examples
 
+    def label_field(self):
+        return "AnswerRightEnding"
 
-def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, threshold):
+
+def convert_examples_to_features(examples, tokenizer, max_seq_length,
+                                 is_training):
     """Loads a data file into a list of `InputBatch`s."""
-    
-    label_list = sorted(label_list)
-    label_map = {label : i for i, label in enumerate(label_list)}
 
-    entity2id = {}
-    with open("kg_embed/entity2id.txt") as fin:
-        fin.readline()
-        for line in fin:
-            qid, eid = line.strip().split('\t')
-            entity2id[qid] = int(eid)
-
+    # Swag is a multiple choice task. To perform this task using Bert,
+    # we will use the formatting proposed in "Improving Language
+    # Understanding by Generative Pre-Training" and suggested by
+    # @jacobdevlin-google in this issue
+    # https://github.com/google-research/bert/issues/38.
+    #
+    # Each choice will correspond to a sample on which we run the
+    # inference. For a given Swag example, we will create the 4
+    # following inputs:
+    # - [CLS] context [SEP] choice_1 [SEP]
+    # - [CLS] context [SEP] choice_2 [SEP]
+    # - [CLS] context [SEP] choice_3 [SEP]
+    # - [CLS] context [SEP] choice_4 [SEP]
+    # The model will output a single value for each input. To get the
+    # final decision of the model, we will run a softmax over these 4
+    # outputs.
     features = []
-    for (ex_index, example) in enumerate(examples):
+    for example_index, example in enumerate(examples):
+        context_tokens = tokenizer.tokenize(example.context_sentence)
+        start_ending_tokens = tokenizer.tokenize(example.start_ending)
 
-        ex_text_a = example.text_a[0]
-        h, t = example.text_a[1]
-        h_name = ex_text_a[h[1]:h[2]]
-        t_name = ex_text_a[t[1]:t[2]]
-        #ex_text_a = ex_text_a.replace(h_name, "# "+h_name+" #", 1)
-        #ex_text_a = ex_text_a.replace(t_name, "$ "+t_name+" $", 1)
-        # Add [HD] and [TL], which are "#" and "$" respectively.
-        if h[1] < t[1]:
-            ex_text_a = ex_text_a[:h[1]] + "# "+h_name+" #" + ex_text_a[h[2]:t[1]] + "$ "+t_name+" $" + ex_text_a[t[2]:]
-        else:
-            ex_text_a = ex_text_a[:t[1]] + "$ "+t_name+" $" + ex_text_a[t[2]:h[1]] + "# "+h_name+" #" + ex_text_a[h[2]:]
+        choices_features = []
+        for ending_index, ending in enumerate(example.endings):
+            # We create a copy of the context tokens in order to be
+            # able to shrink it according to ending_tokens
+            context_tokens_choice = context_tokens[:]
+            ending_tokens = tokenizer.tokenize(ending)
+            option_len = len(ending_tokens)
+            ques_len = len(start_ending_tokens)
+            ending_tokens = start_ending_tokens + ending_tokens
 
-        ent_pos = [x for x in example.text_b if x[-1]>threshold]
-        for x in ent_pos:
-            cnt = 0
-            if x[1] > h[2]:
-                cnt += 2
-            if x[1] >= h[1]:
-                cnt += 2
-            if x[1] >= t[1]:
-                cnt += 2
-            if x[1] > t[2]:
-                cnt += 2
-            x[1] += cnt
-            x[2] += cnt
-        tokens_a, entities_a = tokenizer.tokenize(ex_text_a, ent_pos)
-        '''
-        cnt = 0
-        for x in entities_a:
-            if x != "UNK":
-                cnt += 1
-        if cnt != len(ent_pos) and ent_pos[0][0] != 'Q46809':
-            print(cnt, len(ent_pos))
-            print(ex_text_a)
-            print(ent_pos)
-            for x in ent_pos:
-                print(ex_text_a[x[1]:x[2]])
-            exit(1)
-        '''
+            # Modifies `context_tokens_choice` and `ending_tokens` in
+            # place so that the total length is less than the
+            # specified length.  Account for [CLS], [SEP], [SEP] with "- 3"
+            # ending_tokens = start_ending_tokens + ending_tokens
+            _truncate_seq_pair(context_tokens_choice, ending_tokens, max_seq_length - 3)
+            doc_len = len(context_tokens_choice)
 
-        tokens_b = None
-        if False:
-            tokens_b, entities_b = tokenizer.tokenize(example.text_b[0], [x for x in example.text_b[1] if x[-1]>threshold])
-            # Modifies `tokens_a` and `tokens_b` in place so that the total
-            # length is less than the specified length.
-            # Account for [CLS], [SEP], [SEP] with "- 3"
-            _truncate_seq_pair(tokens_a, tokens_b, entities_a, entities_b, max_seq_length - 3)
-        else:
-            # Account for [CLS] and [SEP] with "- 2"
-            if len(tokens_a) > max_seq_length - 2:
-                tokens_a = tokens_a[:(max_seq_length - 2)]
-                entities_a = entities_a[:(max_seq_length - 2)]
+            tokens = ["[CLS]"] + context_tokens_choice + ["[SEP]"] + ending_tokens + ["[SEP]"]
+            segment_ids = [0] * (len(context_tokens_choice) + 2) + [1] * (len(ending_tokens) + 1)
 
-        # The convention in BERT is:
-        # (a) For sequence pairs:
-        #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
-        #  type_ids: 0   0  0    0    0     0       0 0    1  1  1  1   1 1
-        # (b) For single sequences:
-        #  tokens:   [CLS] the dog is hairy . [SEP]
-        #  type_ids: 0   0   0   0  0     0 0
-        #
-        # Where "type_ids" are used to indicate whether this is the first
-        # sequence or the second sequence. The embedding vectors for `type=0` and
-        # `type=1` were learned during pre-training and are added to the wordpiece
-        # embedding vector (and position vector). This is not *strictly* necessary
-        # since the [SEP] token unambigiously separates the sequences, but it makes
-        # it easier for the model to learn the concept of sequences.
-        #
-        # For classification tasks, the first vector (corresponding to [CLS]) is
-        # used as as the "sentence vector". Note that this only makes sense because
-        # the entire model is fine-tuned.
-        tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
-        ents = ["UNK"] + entities_a + ["UNK"]
-        segment_ids = [0] * len(tokens)
+            input_ids = tokenizer.convert_tokens_to_ids(tokens)
+            input_mask = [1] * len(input_ids)
 
-        if tokens_b:
-            tokens += tokens_b + ["[SEP]"]
-            ents += entities_b + ["UNK"]
-            segment_ids += [1] * (len(tokens_b) + 1)
+            # Zero-pad up to the sequence length.
+            padding = [0] * (max_seq_length - len(input_ids))
+            input_ids += padding
+            input_mask += padding
+            segment_ids += padding
 
-        input_ids = tokenizer.convert_tokens_to_ids(tokens)
-        input_ent = []
-        ent_mask = []
-        for ent in ents:
-            if ent != "UNK" and ent in entity2id:
-                input_ent.append(entity2id[ent])
-                ent_mask.append(1)
-            else:
-                input_ent.append(-1)
-                ent_mask.append(0)
-        ent_mask[0] = 1
+            assert len(input_ids) == max_seq_length
+            assert len(input_mask) == max_seq_length
+            assert len(segment_ids) == max_seq_length
+            assert (doc_len + ques_len + option_len) <= max_seq_length
 
-        # The mask has 1 for real tokens and 0 for padding tokens. Only real
-        # tokens are attended to.
-        input_mask = [1] * len(input_ids)
+            choices_features.append((tokens, input_ids, input_mask, segment_ids,
+                                     doc_len, ques_len, option_len))
 
-        # Zero-pad up to the sequence length.
-        padding = [0] * (max_seq_length - len(input_ids))
-        padding_ = [-1] * (max_seq_length - len(input_ids))
-        input_ids += padding
-        input_mask += padding
-        segment_ids += padding
-        input_ent += padding_
-        ent_mask += padding
-
-        assert len(input_ids) == max_seq_length
-        assert len(input_mask) == max_seq_length
-        assert len(segment_ids) == max_seq_length
-        assert len(input_ent) == max_seq_length
-        assert len(ent_mask) == max_seq_length
-
-        label_id = label_map[example.label]
-        if ex_index < 5:
+        label = int(example.label)
+        if example_index < 5:
             logger.info("*** Example ***")
-            logger.info("guid: %s" % (example.guid))
-            logger.info("tokens: %s" % " ".join(
-                    [str(x) for x in tokens]))
-            logger.info("ents: %s" % " ".join(
-                    [str(x) for x in ents]))
-            logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-            logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
-            logger.info(
-                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-            logger.info("label: %s (id = %d)" % (example.label, label_id))
+            logger.info(f"swag_id: {example.swag_id}")
+            for choice_idx, (tokens, input_ids, input_mask, segment_ids, doc_len,
+                             ques_len, option_len) in enumerate(choices_features):
+                logger.info(f"choice: {choice_idx}")
+                logger.info(f"tokens: {' '.join(tokens)}")
+                logger.info(f"input_ids: {' '.join(map(str, input_ids))}")
+                logger.info(f"input_mask: {' '.join(map(str, input_mask))}")
+                logger.info(f"segment_ids: {' '.join(map(str, segment_ids))}")
+            if is_training:
+                logger.info(f"label: {label}")
 
         features.append(
-                InputFeatures(input_ids=input_ids,
-                              input_mask=input_mask,
-                              segment_ids=segment_ids,
-                              input_ent=input_ent,
-                              ent_mask=ent_mask,
-                              label_id=label_id))
+            InputFeatures(
+                example_id=example.swag_id,
+                choices_features=choices_features,
+                label=label
+            )
+        )
+
     return features
 
 
-def _truncate_seq_pair(tokens_a, tokens_b, ents_a, ents_b, max_length):
+def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
 
     # This is a simple heuristic which will always truncate the longer sequence
@@ -295,19 +250,36 @@ def _truncate_seq_pair(tokens_a, tokens_b, ents_a, ents_b, max_length):
             break
         if len(tokens_a) > len(tokens_b):
             tokens_a.pop()
-            ents_a.pop()
         else:
             tokens_b.pop()
-            ents_b.pop()
+
+
+def _truncate_sequences(max_length, inputs):
+    idx = 0
+    for ta, tb in zip(inputs[0], inputs[1]):
+        _truncate_seq_pair(ta, tb, max_length)
+
 
 def accuracy(out, labels):
     outputs = np.argmax(out, axis=1)
     return np.sum(outputs == labels)
 
+
 def warmup_linear(x, warmup=0.002):
     if x < warmup:
-        return x/warmup
-    return 1.0
+        return x / warmup
+    return 1.0 - x
+
+
+def select_field(features, field):
+    return [
+        [
+            choice[field]
+            for choice in feature.choices_features
+        ]
+        for feature in features
+    ]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -391,7 +363,7 @@ def main():
 
     args = parser.parse_args()
 
-    processors = TacredProcessor
+    processors = FewrelProcessor
 
     num_labels_task = 80
 
@@ -419,7 +391,7 @@ def main():
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-    if not args.do_train and not args.do_eval:
+    if not args.do_train:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
@@ -428,6 +400,7 @@ def main():
 
 
     processor = processors()
+    num_labels = num_labels_task
     label_list = None
 
     tokenizer = BertTokenizer.from_pretrained(args.ernie_model, do_lower_case=args.do_lower_case)
@@ -435,13 +408,11 @@ def main():
     train_examples = None
     num_train_steps = None
     train_examples, label_list = processor.get_train_examples(args.data_dir)
-    num_labels = len(label_list)
-    
     num_train_steps = int(
         len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps * args.num_train_epochs)
 
     # Prepare model
-    model, _ = BertForSequenceClassification.from_pretrained(args.ernie_model,
+    model, _ = BertForMultipleChoice.from_pretrained(args.ernie_model,
               cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(args.local_rank),
               num_labels = num_labels)
     if args.fp16:
@@ -494,11 +465,7 @@ def main():
     if args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer, args.threshold)
-        logger.info("***** Running training *****")
-        logger.info("  Num examples = %d", len(train_examples))
-        logger.info("  Batch size = %d", args.train_batch_size)
-        logger.info("  Num steps = %d", num_train_steps)
- 
+
         vecs = []
         vecs.append([0]*100)
         with open("kg_embed/entity2vec.vec", 'r') as fin:
@@ -513,9 +480,11 @@ def main():
         logger.info("Shape of entity embedding: "+str(embed.weight.size()))
         del vecs
 
-        # zeros = [0 for _ in range(args.max_seq_length)]
-        # zeros_ent = [0 for _ in range(100)]
-        # zeros_ent = [zeros_ent for _ in range(args.max_seq_length)]
+
+        logger.info("***** Running training *****")
+        logger.info("  Num examples = %d", len(train_examples))
+        logger.info("  Batch size = %d", args.train_batch_size)
+        logger.info("  Num steps = %d", num_train_steps)
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
