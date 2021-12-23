@@ -1,0 +1,6 @@
+# based on cuda11.0-py3.6-deepspeed0.4.0-pytorch1.7
+tensorflow==1.13.1
+tqdm
+requests
+boto3
+simplejson
