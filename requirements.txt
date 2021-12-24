@@ -1,3 +1,4 @@
 # based on cuda11.0-py3.6-deepspeed0.4.0-pytorch1.7
 nltk
 simplejson
+boto3
